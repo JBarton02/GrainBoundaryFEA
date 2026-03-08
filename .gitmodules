@@ -4,3 +4,6 @@
 [submodule "glvis"]
 	path = glvis
 	url = https://github.com/GLVis/glvis.git
+[submodule "gmsh"]
+	path = gmsh
+	url = https://gitlab.onelab.info/gmsh/gmsh.git
