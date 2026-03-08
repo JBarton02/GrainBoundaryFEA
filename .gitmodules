@@ -1,0 +1,6 @@
+[submodule "mfem"]
+	path = mfem
+	url = https://github.com/mfem/mfem.git
+[submodule "glvis"]
+	path = glvis
+	url = https://github.com/GLVis/glvis.git
