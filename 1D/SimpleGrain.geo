@@ -1,0 +1,56 @@
+// SetFactory("OpenCASCADE");
+
+lc = 0.1;
+lc2 = 1.5;
+Point(1) = {0, 0, 0, lc2};
+Point(2) = {-0, 1, 0, lc2};
+Point(3) = {1, 1, 0, lc};
+Point(4) = {1.5, 0, 0, lc};
+Line(1) = {1, 2};
+Line(2) = {3, 2};
+Line(3) = {1, 4};
+Line(4) = {4, 3};
+Point(5) = {0, 0, 0.5, lc2};
+Point(6) = {0, 1, 0.5, lc2};
+Point(7) = {1, 1, 0.5, lc};
+Point(8) = {1.5, 0, 0.5, lc};
+Line(5) = {5, 8};
+Line(6) = {8, 7};
+Line(7) = {6, 7};
+Line(8) = {6, 5};
+Line(9) = {8, 4};
+Line(10) = {7, 3};
+Line(11) = {6, 2};
+Line(12) = {1, 5};
+Curve Loop(1) = {6, 10, -4, -9};
+Plane Surface(1) = {1};
+Physical Surface("Grain", 13) = {1};
+Curve Loop(2) = {11, -2, -10, -7};
+Plane Surface(2) = {2};
+Curve Loop(3) = {8, -12, 1, -11};
+Plane Surface(3) = {3};
+Curve Loop(4) = {2, -1, 3, 4};
+Plane Surface(4) = {4};
+Curve Loop(5) = {3, -9, -5, -12};
+Plane Surface(5) = {5};
+Curve Loop(6) = {5, 6, -7, 8};
+Plane Surface(6) = {6};
+Surface Loop(1) = {1, 6, 5, 4, 2, 3};
+Volume(1) = {1};
+Physical Volume("Material", 14) = {1};
+
+// Mesh.RecombineAll = 1;
+
+// Field[1] = Distance;
+// Field[1].PointsList = {4,7,8};
+// Field[1].CurvesList = {1};
+// Field[1].Sampling = 100;
+// Field[2] = Threshold;
+// Field[2].InField = 1;
+// Field[2].SizeMin = lc / 30;
+// Field[2].SizeMax = lc;
+// Field[2].DistMin = 0.15;
+// Field[2].DistMax = 0.5;
+
+// RefineMesh;
+Mesh.MshFileVersion = 2.2;
