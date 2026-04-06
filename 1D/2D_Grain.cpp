@@ -1,64 +1,109 @@
 //  1D Grain proof of concept
-//  built upon MFEM examples 1 & 27
+//  built upon MFEM examples 16 & 22
 
 #include "mfem.hpp"
 #include <fstream>
 #include <iostream>
 #include <mfem/fem/coefficient.hpp>
+#include <mfem/fem/fe_coll.hpp>
 #include <mfem/fem/gridfunc.hpp>
+#include <mfem/linalg/complex_operator.hpp>
+#include <mfem/linalg/operator.hpp>
+#include <mfem/linalg/vector.hpp>
 
 using namespace std;
 using namespace mfem;
 
-// Custom integraition of boundary conditions function declaration
-real_t IntegrateBC(const GridFunction &sol, const Array<int> &bdr_marker,
-                   real_t alpha, real_t beta, real_t gamma, real_t &error);
+// Material Properties
+static real_t c_p = 1.6e6; // Heat Capacity [J/m^3-K]
+static real_t k = 1.3;     // Thermal conductivity [W/m-K]
+static real_t rho = 2200;  // Density of SiO_2 [Kg/m^3]
+static real_t thermalDiffusivity =
+    k / (c_p * rho); // Thermal diffusivity of material properties [m^2/s]
+
+class ConductionOperator : public TimeDependentOperator {
+protected:
+  FiniteElementSpace &fespace;
+  Array<int> ess_tdof_list; // this list remains empty for pure Neumann b.c.
+
+  BilinearForm *M;
+  BilinearForm *K;
+
+  SparseMatrix Mmat, Kmat;
+  SparseMatrix *T; // T = M + dt K
+  real_t current_dt;
+
+  CGSolver M_solver; // Krylov solver for inverting the mass matrix M
+  DSmoother M_prec;  // Preconditioner for the mass matrix M
+
+  CGSolver T_solver; // Implicit solver for T = M + dt K
+  DSmoother T_prec;  // Preconditioner for the implicit solver
+
+  real_t alpha, kappa;
+
+  mutable Vector z; // auxiliary vector
+
+public:
+  ConductionOperator(FiniteElementSpace &f, real_t alpha, real_t kappa,
+                     const Vector &u);
+
+  void Mult(const Vector &u, Vector &du_dt) const override;
+  /** Solve the Backward-Euler equation: k = f(u + dt*k, t), for the unknown k.
+      This is the only requirement for high-order SDIRK implicit integration.*/
+  void ImplicitSolve(const real_t dt, const Vector &u, Vector &k) override;
+
+  /// Update the diffusion BilinearForm K using the given true-dof vector `u`.
+  void SetParameters(const Vector &u);
+
+  ~ConductionOperator() override;
+};
+
+real_t InitialTemperature(const Vector &x);
+real_t omega_ = 10.0;
 
 int main(int argc, char *argv[]) {
   // Parameters for the analysis.
-  const char *mesh_file = "2D_Grain.msh";
-  int order = 1;
-  // int order = 0;
-  bool static_cond = false;
-  bool pa = false;
-  bool fa = false;
-  bool h1 = true;
-  const char *device_config = "cpu";
+  const char *mesh_file = "SimpleGrain.msh";
+  int order = 2;
+  int ref_levels = 2;
+
+  int ode_solver_type = 23; // SDIRK33Solver
+  real_t t_final = 0.5;
+  real_t dt = 1.0e-2;
+  real_t alpha = 1.0e-2;
+  real_t kappa = 0.5;
+
   bool visualization = true;
-  bool algebraic_ceed = false;
+  bool visit = false;
+  int vis_steps = 5;
+  bool solve_implicit_state = false;
 
-  real_t mat_val = 1.30; // SiO_2 heat capacity[W/m-K]
-  // real_t mat_val = 1000000.0; // SiO_2 heat conductivity coefficient
-  // [J/m^3-K]
-  real_t dbc_val = 0.0;
-  real_t nbc_val = 500.0; // Heat flux assumed at 500 [W/m^2]
-  real_t rbc_a_val = 0.0; // du/dn + a * u = b
-  real_t rbc_b_val = 0.0;
+  int precision = 8;
+  cout.precision(precision);
 
-  real_t kappa = -1.0;
-  real_t sigma = -1.0;
-
-  // Parse command-line options.
   OptionsParser args(argc, argv);
   args.AddOption(&mesh_file, "-m", "--mesh", "Mesh file to use.");
+  args.AddOption(&ref_levels, "-r", "--refine",
+                 "Number of times to refine the mesh uniformly.");
   args.AddOption(&order, "-o", "--order",
-                 "Finite element order (polynomial degree) or -1 for"
-                 " isoparametric space.");
-  args.AddOption(&static_cond, "-sc", "--static-condensation", "-no-sc",
-                 "--no-static-condensation", "Enable static condensation.");
-  args.AddOption(&pa, "-pa", "--partial-assembly", "-no-pa",
-                 "--no-partial-assembly", "Enable Partial Assembly.");
-  args.AddOption(&fa, "-fa", "--full-assembly", "-no-fa", "--no-full-assembly",
-                 "Enable Full Assembly.");
-  args.AddOption(&device_config, "-d", "--device",
-                 "Device configuration string, see Device::Configure().");
-#ifdef MFEM_USE_CEED
-  args.AddOption(&algebraic_ceed, "-a", "--algebraic", "-no-a",
-                 "--no-algebraic", "Use algebraic Ceed solver");
-#endif
+                 "Order (degree) of the finite elements.");
+  args.AddOption(&ode_solver_type, "-s", "--ode-solver",
+                 ODESolver::Types.c_str());
+  args.AddOption(&t_final, "-tf", "--t-final", "Final time; start time is 0.");
+  args.AddOption(&dt, "-dt", "--time-step", "Time step.");
+  args.AddOption(&alpha, "-a", "--alpha", "Alpha coefficient.");
+  args.AddOption(&kappa, "-k", "--kappa", "Kappa coefficient offset.");
+  args.AddOption(&solve_implicit_state, "-imp-state", "--implicit-state",
+                 "-imp-slope", "--implicit-slope",
+                 "Implicitly solve for stage state or slope.");
   args.AddOption(&visualization, "-vis", "--visualization", "-no-vis",
                  "--no-visualization",
                  "Enable or disable GLVis visualization.");
+  args.AddOption(&visit, "-visit", "--visit-datafiles", "-no-visit",
+                 "--no-visit-datafiles",
+                 "Save data files for VisIt (visit.llnl.gov) visualization.");
+  args.AddOption(&vis_steps, "-vs", "--visualization-steps",
+                 "Visualize every n-th timestep.");
   args.Parse();
   if (!args.Good()) {
     args.PrintUsage(cout);
@@ -66,327 +111,225 @@ int main(int argc, char *argv[]) {
   }
   args.PrintOptions(cout);
 
-  // Read the mesh from the given mesh file.
-  Mesh mesh(mesh_file, 1, 1);
-  int dim = mesh.Dimension();
+  // 2. Read the mesh from the given mesh file. We can handle triangular,
+  //    quadrilateral, tetrahedral and hexahedral meshes with the same code.
+  Mesh *mesh = new Mesh(mesh_file, 1, 1);
+  int dim = mesh->Dimension();
 
-  // Define a finite element space on the mesh. Here we use continuous
-  // Lagrange finite elements of the specified order. If order < 1, we
-  // instead use an isoparametric/isogeometric space.
-  FiniteElementCollection *fec;
-  bool delete_fec;
-  if (order > 0) {
-    fec = new H1_FECollection(order, dim);
-    delete_fec = true;
-  } else if (mesh.GetNodes()) {
-    fec = mesh.GetNodes()->OwnFEC();
-    delete_fec = false;
-    cout << "Using isoparametric FEs: " << fec->Name() << endl;
-  } else {
-    fec = new H1_FECollection(order = 1, dim);
-    delete_fec = true;
-  }
-  FiniteElementSpace fespace(&mesh, fec);
-  cout << "Number of finite element unknowns: " << fespace.GetTrueVSize()
-       << endl;
+  // 3. Define the ODE solver used for time integration. Several implicit
+  //    singly diagonal implicit Runge-Kutta (SDIRK) methods, as well as
+  //    explicit Runge-Kutta methods are available.
+  unique_ptr<ODESolver> ode_solver = ODESolver::Select(ode_solver_type);
 
-  // Create "marker arrays" to define the portions of boundary associated
-  // with each type of boundary condition. These arrays have an entry
-  // corresponding to each boundary attribute.  Placing a '1' in entry i
-  // marks attribute i+1 as being active, '0' is inactive.
-  Array<int> nbc_bdr(mesh.bdr_attributes.Max());
-  Array<int> rbc_bdr(mesh.bdr_attributes.Max());
-  Array<int> dbc_bdr(mesh.bdr_attributes.Max());
-
-  nbc_bdr = 1;
-  // nbc_bdr[0] = 1;
-  cout << nbc_bdr.Size() << endl;
-  for (int i = 0; i < nbc_bdr.Size(); i++) {
-    nbc_bdr[i] = i;
-    cout << nbc_bdr[i] << endl;
+  // 4. Refine the mesh to increase the resolution. In this example we do
+  //    'ref_levels' of uniform refinement, where 'ref_levels' is a
+  //    command-line parameter.
+  for (int lev = 0; lev < ref_levels; lev++) {
+    mesh->UniformRefinement();
   }
 
-  rbc_bdr = 0;
-  rbc_bdr[1] = 0;
-  dbc_bdr = 0;
-  dbc_bdr[2] = 0;
+  // 5. Define the vector finite element space representing the current and the
+  //    initial temperature, u_ref.
+  H1_FECollection fe_coll(order, dim);
+  FiniteElementSpace fespace(mesh, &fe_coll);
 
-  Array<int> ess_tdof_list;
+  int fe_size = fespace.GetTrueVSize();
+  cout << "Number of temperature unknowns: " << fe_size << endl;
 
-  if (h1 && mesh.bdr_attributes.Size()) {
-    cout << mesh.bdr_attributes.Max() << endl;
-    Array<int> ess_tdof_list(mesh.bdr_attributes.Max());
-    // For a continuous basis the linear system must be modified to enforce an
-    // essential (Dirichlet) boundary condition. In the DG case this is not
-    // necessary as the boundary condition will only be enforced weakly.
-    fespace.GetEssentialTrueDofs(dbc_bdr, ess_tdof_list);
-  }
+  GridFunction u_gf(&fespace);
 
-  // 5. Setup the various coefficients needed for the Laplace operator and the
-  //    various boundary conditions. In general these coefficients could be
-  //    functions of position but here we use only constants.
+  // 6. Set the initial conditions for u. All boundaries are considered
+  //    natural.
+  FunctionCoefficient u_0(InitialTemperature);
+  u_gf.ProjectCoefficient(u_0);
+  Vector u;
+  u_gf.GetTrueDofs(u);
 
-  ConstantCoefficient matCoef(mat_val);
-  ConstantCoefficient dbcCoef(dbc_val);
-  ConstantCoefficient nbcCoef(nbc_val);
-  ConstantCoefficient rbcACoef(rbc_a_val);
-  ConstantCoefficient rbcBCoef(rbc_b_val);
+  // 7. Initialize the conduction operator and the visualization.
+  ConductionOperator oper(fespace, alpha, kappa, u);
+  using ImplicitVariableType = ConductionOperator::ImplicitVariableType;
+  ImplicitVariableType imp_var = solve_implicit_state
+                                     ? ImplicitVariableType::STATE
+                                     : ImplicitVariableType::SLOPE;
+  oper.SetImplicitVariableType(imp_var);
 
-  // Since the n.Grad(u) terms arise by integrating -Div(m Grad(u)) by parts we
-  // must introduce the coefficient 'm' into the boundary conditions.
-  // Therefore, in the case of the Neumann BC, we actually enforce m n.Grad(u)
-  // = m g rather than simply n.Grad(u) = g.
-  ProductCoefficient m_nbcCoef(matCoef, nbcCoef);
-  ProductCoefficient m_rbcACoef(matCoef, rbcACoef);
-  ProductCoefficient m_rbcBCoef(matCoef, rbcBCoef);
-
-  // 6. Define the solution vector u as a finite element grid function
-  //    corresponding to fespace. Initialize u with initial guess of zero.
-  GridFunction u(&fespace);
-  u = 0.0;
-
-  // 7. Set up the bilinear form a(.,.) on the finite element space
-  //    corresponding to the Laplacian operator -Delta, by adding the Diffusion
-  //    domain integrator.
-  BilinearForm a(&fespace);
-  a.AddDomainIntegrator(new DiffusionIntegrator(matCoef));
-  if (h1) {
-    // Add a Mass integrator on the Robin boundary
-    a.AddBoundaryIntegrator(new MassIntegrator(m_rbcACoef), rbc_bdr);
-  } else {
-    // Add the interfacial portion of the Laplace operator
-    a.AddInteriorFaceIntegrator(
-        new DGDiffusionIntegrator(matCoef, sigma, kappa));
-
-    // Counteract the n.Grad(u) term on the Dirichlet portion of the boundary
-    a.AddBdrFaceIntegrator(new DGDiffusionIntegrator(matCoef, sigma, kappa),
-                           dbc_bdr);
-
-    // Augment the n.Grad(u) term with a*u on the Robin portion of boundary
-    a.AddBdrFaceIntegrator(new BoundaryMassIntegrator(m_rbcACoef), rbc_bdr);
-  }
-  a.Assemble();
-
-  // 8. Assemble the linear form for the right hand side vector.
-  LinearForm b(&fespace);
-
-  if (h1) {
-    // Set the Dirichlet values in the solution vector
-    u.ProjectBdrCoefficient(dbcCoef, dbc_bdr);
-
-    // Add the desired value for n.Grad(u) on the Neumann boundary
-    b.AddBoundaryIntegrator(new BoundaryLFIntegrator(m_nbcCoef), nbc_bdr);
-
-    // Add the desired value for n.Grad(u) + a*u on the Robin boundary
-    b.AddBoundaryIntegrator(new BoundaryLFIntegrator(m_rbcBCoef), rbc_bdr);
-  } else {
-    // Add the desired value for the Dirichlet boundary
-    b.AddBdrFaceIntegrator(
-        new DGDirichletLFIntegrator(dbcCoef, matCoef, sigma, kappa), dbc_bdr);
-
-    // Add the desired value for n.Grad(u) on the Neumann boundary
-    b.AddBdrFaceIntegrator(new BoundaryLFIntegrator(m_nbcCoef), nbc_bdr);
-
-    // Add the desired value for n.Grad(u) + a*u on the Robin boundary
-    b.AddBdrFaceIntegrator(new BoundaryLFIntegrator(m_rbcBCoef), rbc_bdr);
-  }
-  b.Assemble();
-
-  // 9. Construct the linear system.
-  OperatorPtr A;
-  Vector B, X;
-  a.FormLinearSystem(ess_tdof_list, u, b, A, X, B);
-
-#ifndef MFEM_USE_SUITESPARSE
-  // 10. Define a simple symmetric Gauss-Seidel preconditioner and use it to
-  //     solve the system AX=B with PCG in the symmetric case, and GMRES in the
-  //     non-symmetric one.
+  u_gf.SetFromTrueDofs(u);
   {
-    GSSmoother M((SparseMatrix &)(*A));
-    if (sigma == -1.0) {
-      PCG(*A, M, B, X, 1, 500, 1e-12, 0.0);
-    } else {
-      GMRES(*A, M, B, X, 1, 500, 10, 1e-12, 0.0);
-    }
-  }
-#else
-  // 11. If MFEM was compiled with SuiteSparse, use UMFPACK to solve the
-  //     system.
-  UMFPackSolver umf_solver;
-  umf_solver.Control[UMFPACK_ORDERING] = UMFPACK_ORDERING_METIS;
-  umf_solver.SetOperator(*A);
-  umf_solver.Mult(B, X);
-#endif
-
-  // 12. Recover the grid function corresponding to U. This is the local finite
-  //     element solution.
-  a.RecoverFEMSolution(X, b, u);
-
-  // 13. Compute the various boundary integrals.
-  mfem::out << endl
-            << "Verifying boundary conditions" << endl
-            << "=============================" << endl;
-  {
-    // Integrate the solution on the Dirichlet boundary and compare to the
-    // expected value.
-    real_t error, avg = IntegrateBC(u, dbc_bdr, 0.0, 1.0, dbc_val, error);
-
-    bool hom_dbc = (dbc_val == 0.0);
-    error /= hom_dbc ? 1.0 : fabs(dbc_val);
-    mfem::out << "Average of solution on Gamma_dbc:\t" << avg << ", \t"
-              << (hom_dbc ? "absolute" : "relative") << " error " << error
-              << endl;
-  }
-  {
-    // Integrate n.Grad(u) on the inhomogeneous Neumann boundary and compare
-    // to the expected value.
-    real_t error, avg = IntegrateBC(u, nbc_bdr, 1.0, 0.0, nbc_val, error);
-
-    bool hom_nbc = (nbc_val == 0.0);
-    error /= hom_nbc ? 1.0 : fabs(nbc_val);
-    mfem::out << "Average of n.Grad(u) on Gamma_nbc:\t" << avg << ", \t"
-              << (hom_nbc ? "absolute" : "relative") << " error " << error
-              << endl;
-  }
-  {
-    // Integrate n.Grad(u) on the homogeneous Neumann boundary and compare to
-    // the expected value of zero.
-    Array<int> nbc0_bdr(mesh.bdr_attributes.Max());
-    nbc0_bdr = 0;
-    nbc0_bdr[3] = 1;
-
-    real_t error, avg = IntegrateBC(u, nbc0_bdr, 1.0, 0.0, 0.0, error);
-
-    bool hom_nbc = true;
-    mfem::out << "Average of n.Grad(u) on Gamma_nbc0:\t" << avg << ", \t"
-              << (hom_nbc ? "absolute" : "relative") << " error " << error
-              << endl;
-  }
-  {
-    // Integrate n.Grad(u) + a * u on the Robin boundary and compare to the
-    // expected value.
-    real_t error;
-    real_t avg = IntegrateBC(u, rbc_bdr, 1.0, rbc_a_val, rbc_b_val, error);
-
-    bool hom_rbc = (rbc_b_val == 0.0);
-    error /= hom_rbc ? 1.0 : fabs(rbc_b_val);
-    mfem::out << "Average of n.Grad(u)+a*u on Gamma_rbc:\t" << avg << ", \t"
-              << (hom_rbc ? "absolute" : "relative") << " error " << error
-              << endl;
+    ofstream omesh("ex16.mesh");
+    omesh.precision(precision);
+    mesh->Print(omesh);
+    ofstream osol("ex16-init.gf");
+    osol.precision(precision);
+    u_gf.Save(osol);
   }
 
-  // 14. Save the refined mesh and the solution. This output can be viewed
-  //     later using GLVis: "glvis -m refined.mesh -g sol.gf".
-  {
-    ofstream mesh_ofs("refined.mesh");
-    mesh_ofs.precision(8);
-    mesh.Print(mesh_ofs);
-    ofstream sol_ofs("sol.gf");
-    sol_ofs.precision(8);
-    u.Save(sol_ofs);
+  VisItDataCollection visit_dc("Example16", mesh);
+  visit_dc.RegisterField("temperature", &u_gf);
+  if (visit) {
+    visit_dc.SetCycle(0);
+    visit_dc.SetTime(0.0);
+    visit_dc.Save();
   }
 
+  socketstream sout;
   if (visualization) {
-    string title_str = h1 ? "H1" : "DG";
     char vishost[] = "localhost";
     int visport = 19916;
-    socketstream sol_sock(vishost, visport);
-    sol_sock.precision(8);
-    sol_sock << "solution\n"
-             << mesh << u << "window_title '" << title_str << " Solution'"
-             << " keys 'mmc'" << flush;
+    sout.open(vishost, visport);
+    if (!sout) {
+      cout << "Unable to connect to GLVis server at " << vishost << ':'
+           << visport << endl;
+      visualization = false;
+      cout << "GLVis visualization disabled.\n";
+    } else {
+      sout.precision(precision);
+      sout << "solution\n" << *mesh << u_gf;
+      sout << "pause\n";
+      sout << flush;
+      cout << "GLVis visualization paused."
+           << " Press space (in the GLVis window) to resume it.\n";
+    }
   }
 
-  // 15. Free the used memory.
-  if (delete_fec) {
-    delete fec;
+  // 8. Perform time-integration (looping over the time iterations, ti, with a
+  //    time-step dt).
+  ode_solver->Init(oper);
+  real_t t = 0.0;
+
+  bool last_step = false;
+  for (int ti = 1; !last_step; ti++) {
+    if (t + dt >= t_final - dt / 2) {
+      last_step = true;
+    }
+
+    ode_solver->Step(u, t, dt);
+
+    if (last_step || (ti % vis_steps) == 0) {
+      cout << "step " << ti << ", t = " << t << endl;
+
+      u_gf.SetFromTrueDofs(u);
+      if (visualization) {
+        sout << "solution\n" << *mesh << u_gf << flush;
+      }
+
+      if (visit) {
+        visit_dc.SetCycle(ti);
+        visit_dc.SetTime(t);
+        visit_dc.Save();
+      }
+    }
+    oper.SetParameters(u);
   }
 
-  return 0;
+  // 9. Save the final solution. This output can be viewed later using GLVis:
+  //    "glvis -m ex16.mesh -g ex16-final.gf".
+  {
+    ofstream osol("ex16-final.gf");
+    osol.precision(precision);
+    u_gf.Save(osol);
+  }
+
+  // 10. Free the used memory.
+  delete mesh;
 }
 
-// Custom integration function for boundary conditons defintion
+ConductionOperator::ConductionOperator(FiniteElementSpace &f, real_t al,
+                                       real_t kap, const Vector &u)
+    : TimeDependentOperator(f.GetTrueVSize(), (real_t)0.0), fespace(f), M(NULL),
+      K(NULL), T(NULL), current_dt(0.0), z(height) {
+  const real_t rel_tol = 1e-8;
 
-real_t IntegrateBC(const GridFunction &x, const Array<int> &bdr, real_t alpha,
-                   real_t beta, real_t gamma, real_t &error) {
-  real_t nrm = 0.0;
-  real_t avg = 0.0;
-  error = 0.0;
+  M = new BilinearForm(&fespace);
+  M->AddDomainIntegrator(new MassIntegrator());
+  M->Assemble();
+  M->FormSystemMatrix(ess_tdof_list, Mmat);
 
-  const bool a_is_zero = alpha == 0.0;
-  const bool b_is_zero = beta == 0.0;
+  M_solver.iterative_mode = false;
+  M_solver.SetRelTol(rel_tol);
+  M_solver.SetAbsTol(0.0);
+  M_solver.SetMaxIter(30);
+  M_solver.SetPrintLevel(0);
+  M_solver.SetPreconditioner(M_prec);
+  M_solver.SetOperator(Mmat);
 
-  const FiniteElementSpace &fes = *x.FESpace();
-  MFEM_ASSERT(fes.GetVDim() == 1, "");
-  Mesh &mesh = *fes.GetMesh();
-  Vector shape, loc_dofs, w_nor;
-  DenseMatrix dshape;
-  Array<int> dof_ids;
-  for (int i = 0; i < mesh.GetNBE(); i++) {
-    if (bdr[mesh.GetBdrAttribute(i) - 1] == 0) {
-      continue;
-    }
+  alpha = al;
+  kappa = kap;
 
-    FaceElementTransformations *FTr = mesh.GetBdrFaceTransformations(i);
-    if (FTr == nullptr) {
-      continue;
-    }
+  T_solver.iterative_mode = false;
+  T_solver.SetRelTol(rel_tol);
+  T_solver.SetAbsTol(0.0);
+  T_solver.SetMaxIter(100);
+  T_solver.SetPrintLevel(0);
+  T_solver.SetPreconditioner(T_prec);
 
-    const FiniteElement &fe = *fes.GetFE(FTr->Elem1No);
-    MFEM_ASSERT(fe.GetMapType() == FiniteElement::VALUE, "");
-    const int int_order = 2 * fe.GetOrder() + 3;
-    const IntegrationRule &ir = IntRules.Get(FTr->FaceGeom, int_order);
+  SetParameters(u);
+}
 
-    fes.GetElementDofs(FTr->Elem1No, dof_ids);
-    x.GetSubVector(dof_ids, loc_dofs);
-    if (!a_is_zero) {
-      const int sdim = FTr->Face->GetSpaceDim();
-      w_nor.SetSize(sdim);
-      dshape.SetSize(fe.GetDof(), sdim);
-    }
-    if (!b_is_zero) {
-      shape.SetSize(fe.GetDof());
-    }
-    for (int j = 0; j < ir.GetNPoints(); j++) {
-      const IntegrationPoint &ip = ir.IntPoint(j);
-      IntegrationPoint eip;
-      FTr->Loc1.Transform(ip, eip);
-      FTr->Face->SetIntPoint(&ip);
-      real_t face_weight = FTr->Face->Weight();
-      real_t val = 0.0;
-      if (!a_is_zero) {
-        FTr->Elem1->SetIntPoint(&eip);
-        fe.CalcPhysDShape(*FTr->Elem1, dshape);
-        CalcOrtho(FTr->Face->Jacobian(), w_nor);
-        val += alpha * dshape.InnerProduct(w_nor, loc_dofs) / face_weight;
-      }
-      if (!b_is_zero) {
-        fe.CalcShape(eip, shape);
-        val += beta * (shape * loc_dofs);
-      }
+void ConductionOperator::Mult(const Vector &u, Vector &du_dt) const {
+  // Compute:
+  //    du_dt = M^{-1}*-Ku
+  // for du_dt, where K is linearized by using u from the previous timestep
+  Kmat.Mult(u, z);
+  z.Neg(); // z = -z
+  M_solver.Mult(z, du_dt);
+}
 
-      // Measure the length of the boundary
-      nrm += ip.weight * face_weight;
+void ConductionOperator::ImplicitSolve(const real_t dt, const Vector &u,
+                                       Vector &k) {
+  // Solve the equation:
+  //    M*k = -K(u + dt*k) for k = du/dt, if solving for stage-slope
+  // or
+  //    M*k = -dt*K(k) + M*u for k = u_s, if solving for stage-state
+  // where K is linearized by using u from the previous timestep, and
+  // the stage-state and slope relation: du/dt = (u_s - u)/dt.
+  if (!T) {
+    T = Add(1.0, Mmat, dt, Kmat);
+    current_dt = dt;
+    T_solver.SetOperator(*T);
+  }
+  MFEM_VERIFY(dt == current_dt, ""); // SDIRK methods use the same dt
 
-      // Integrate alpha * n.Grad(x) + beta * x
-      avg += val * ip.weight * face_weight;
+  // Construct current right-hand side for stage state vs. slope solve
+  if (ImplicitVarTypeIsState()) {
+    // k, on return, is the stage value u_s
+    Mmat.Mult(u, z);
+  } else {
+    // k, on return, is the stage slope du/dt
+    Kmat.Mult(u, z);
+    z.Neg();
+  }
+  T_solver.Mult(z, k);
+}
 
-      // Integrate |alpha * n.Grad(x) + beta * x - gamma|^2
-      val -= gamma;
-      error += (val * val) * ip.weight * face_weight;
-    }
+void ConductionOperator::SetParameters(const Vector &u) {
+  GridFunction u_alpha_gf(&fespace);
+  u_alpha_gf.SetFromTrueDofs(u);
+  for (int i = 0; i < u_alpha_gf.Size(); i++) {
+    u_alpha_gf(i) = kappa + alpha * u_alpha_gf(i);
   }
 
-  // Normalize by the length of the boundary
-  if (std::abs(nrm) > 0.0) {
-    error /= nrm;
-    avg /= nrm;
+  delete K;
+  K = new BilinearForm(&fespace);
+
+  GridFunctionCoefficient u_coeff(&u_alpha_gf);
+
+  K->AddDomainIntegrator(new DiffusionIntegrator(u_coeff));
+  K->Assemble();
+  K->FormSystemMatrix(ess_tdof_list, Kmat);
+  delete T;
+  T = NULL; // re-compute T on the next ImplicitSolve
+}
+
+ConductionOperator::~ConductionOperator() {
+  delete T;
+  delete M;
+  delete K;
+}
+
+real_t InitialTemperature(const Vector &x) {
+  if (x.Norml2() < 0.5) {
+    return 2.0;
+  } else {
+    return 1.0;
   }
-
-  // Compute l2 norm of the error in the boundary condition (negative
-  // quadrature weights may produce negative 'error')
-  error = (error >= 0.0) ? sqrt(error) : -sqrt(-error);
-
-  // Return the average value of alpha * n.Grad(x) + beta * x
-  return avg;
 }
