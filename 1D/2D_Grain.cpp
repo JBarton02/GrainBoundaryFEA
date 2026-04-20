@@ -1,15 +1,31 @@
 //  1D Grain proof of concept
-//  built upon MFEM examples 16 & 22
+//  built upon MFEM examples 16, 22, 39
+
+/* The solution should look like such:
+ *
+ * [K] [T] = [Q] + [q]
+ *
+ * Where:
+ *  K is the conductivity matrix
+ *  T is the nodal temperature
+ *  Q is the thermal load from heat source
+ *  q is the vector of nodal heat flow across the cross-section
+ *
+ * This solution should have both a real and imaginary part.
+ *
+ */
 
 #include "mfem.hpp"
 #include <fstream>
 #include <iostream>
 #include <mfem/fem/coefficient.hpp>
 #include <mfem/fem/fe_coll.hpp>
+#include <mfem/fem/fespace.hpp>
 #include <mfem/fem/gridfunc.hpp>
 #include <mfem/linalg/complex_operator.hpp>
 #include <mfem/linalg/operator.hpp>
 #include <mfem/linalg/vector.hpp>
+#include <mfem/mesh/attribute_sets.hpp>
 
 using namespace std;
 using namespace mfem;
@@ -58,20 +74,43 @@ public:
   ~ConductionOperator() override;
 };
 
+class ThermalOperator : public ComplexOperator {
+protected:
+  FiniteElementSpace &fespace;
+  Array<int> ess_tdof_list; // essential boundary conditon list (dirichlet)
+
+  BilinearForm *M;
+  BilinearForm *K;
+
+  SparseMatrix Mmat, Kmat;
+  SparseMatrix *T; // T = M + dt K
+
+  real_t alpha;
+
+  mutable Vector z; // auxiliary vector
+
+public:
+  ThermalOperator(FiniteElementSpace &f, real_t alpha,
+                  Convention convention = HERMITIAN);
+};
+
 real_t InitialTemperature(const Vector &x);
 real_t omega_ = 10.0;
 
 int main(int argc, char *argv[]) {
   // Parameters for the analysis.
-  const char *mesh_file = "SimpleGrain.msh";
+  const char *mesh_file = "2D_Grain.msh";
   int order = 2;
   int ref_levels = 2;
 
   int ode_solver_type = 23; // SDIRK33Solver
   real_t t_final = 0.5;
+  // real_t t_final = 0.3;
+
   real_t dt = 1.0e-2;
   real_t alpha = 1.0e-2;
-  real_t kappa = 0.5;
+  // real_t kappa = 0.5;
+  real_t kappa = 0.1;
 
   bool visualization = true;
   bool visit = false;
@@ -128,6 +167,24 @@ int main(int argc, char *argv[]) {
     mesh->UniformRefinement();
   }
 
+  AttributeSets &attr_sets = mesh->attribute_sets;
+  AttributeSets &bdr_attr_sets = mesh->bdr_attribute_sets;
+  {
+    std::set<string> names = attr_sets.GetAttributeSetNames();
+    cout << "Element Attribute Set Names: ";
+    for (auto const &set_name : names) {
+      cout << " \"" << set_name << "\"";
+    }
+    cout << endl;
+
+    std::set<string> bdr_names = attr_sets.GetAttributeSetNames();
+    cout << "Boundary Attribute Set Names: ";
+    for (auto const &bdr_set_name : bdr_names) {
+      cout << " \"" << bdr_set_name << "\"";
+    }
+    cout << endl;
+  }
+
   // 5. Define the vector finite element space representing the current and the
   //    initial temperature, u_ref.
   H1_FECollection fe_coll(order, dim);
@@ -146,7 +203,8 @@ int main(int argc, char *argv[]) {
   u_gf.GetTrueDofs(u);
 
   // 7. Initialize the conduction operator and the visualization.
-  ConductionOperator oper(fespace, alpha, kappa, u);
+  // ConductionOperator oper(fespace, alpha, kappa, u);
+  ConductionOperator oper(fespace, thermalDiffusivity, kappa, u);
   using ImplicitVariableType = ConductionOperator::ImplicitVariableType;
   ImplicitVariableType imp_var = solve_implicit_state
                                      ? ImplicitVariableType::STATE
@@ -333,3 +391,5 @@ real_t InitialTemperature(const Vector &x) {
     return 1.0;
   }
 }
+
+real_t InitialFlux(const Vector &x) { return 1.0; }
