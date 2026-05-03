@@ -109,4 +109,7 @@ Physical Surface("Surface", 16) = {2, 3, 4, 5, 6, 7, 8, 10, 11, 12};
 // Field[2].DistMax = 0.5;
 // RefineMesh;
 
+//Mesh 2;
+//SetOrder order;
 Mesh.MshFileVersion = 2.2;
+Save "SimpleGrain.msh";
