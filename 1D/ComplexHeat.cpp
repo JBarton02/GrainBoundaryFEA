@@ -4,17 +4,23 @@
 
 #include "mfem.hpp"
 #include <cstddef>
+#include <cstdio>
 #include <fstream>
 #include <iostream>
 #include <mfem/config/config.hpp>
+#include <mfem/fem/bilinearform.hpp>
 #include <mfem/fem/bilininteg.hpp>
 #include <mfem/fem/coefficient.hpp>
+#include <mfem/fem/complex_fem.hpp>
 #include <mfem/fem/fe_coll.hpp>
 #include <mfem/fem/fespace.hpp>
 #include <mfem/general/array.hpp>
 #include <mfem/linalg/complex_operator.hpp>
 #include <mfem/linalg/ode.hpp>
 #include <mfem/linalg/operator.hpp>
+#include <mfem/linalg/solvers.hpp>
+#include <mfem/linalg/sparsemat.hpp>
+#include <mfem/linalg/sparsesmoothers.hpp>
 #include <mfem/linalg/vector.hpp>
 
 using namespace std;
@@ -42,15 +48,27 @@ static real_t rho = 2200; // Density of SiO_2 [Kg/m^3]
 static real_t alpha =
     k / (c_p * rho); // Thermal diffusivity of material properties [m^2/s]
 static real_t alpha_grain = k_grain / (c_p * rho);
-static real_t omega_ = 10.0;
+static real_t omega_ = 1.0;
 
-class ConductionOperator : public ComplexOperator,
-                           public TimeDependentOperator {
+class ConductionOperator : public TimeDependentOperator {
 protected:
   FiniteElementSpace &fespace;
+  Array<int> ess_bdr;
   Array<int> ess_tdof_list; // should remain empty to simulate Neumann B.C.
 
+  BilinearForm *M;
+  BilinearForm *K;
+
+  SparseMatrix Mmat, Kmat;
+  SparseMatrix *T; // T = M + dt K
   real_t current_dt;
+
+  CGSolver M_solver; // Krylov solver for inverting the mass matrix M
+  DSmoother M_prec;  // Preconditioner for the mass matrix M
+
+  CGSolver T_solver; // Implicit solver for T = M + dt K
+  DSmoother T_prec;  // Preconditioner for the implicit solver
+
   real_t alpha; // Diffusive coefficient
 
   mutable Vector z; // Auxillary Vector
@@ -60,18 +78,20 @@ public:
 
   void Mult(const Vector &u, Vector &du_dt) const override;
 
+  /// Update the diffusion BilinearForm K using the given true-dof vector `u`.
   void setParameters(const Vector &u);
 
   ~ConductionOperator() override;
 };
+
+real_t InitialTemperature(const Vector &x);
 
 int main(int argc, char *argv[]) {
   // 1. Parse command-line options.
   const char *mesh_file = "2D_Grain.msh";
   int ref_levels = 1;
   int order = 2;
-  int prob = 0;
-  real_t freq = -4.0;
+  real_t freq = -1.0;
   real_t heatFlux = 500;
 
   bool herm_conv = true;
@@ -111,8 +131,6 @@ int main(int argc, char *argv[]) {
     return 1;
   }
   args.PrintOptions(cout);
-
-  MFEM_VERIFY(prob >= 0 && prob <= 2, "Unrecognized problem type: " << prob);
 
   if (freq > 0.0) {
     omega_ = 2.0 * M_PI * freq;
@@ -307,21 +325,9 @@ int main(int argc, char *argv[]) {
       OperatorHandle PCOp;
       pcOp->SetDiagonalPolicy(mfem::Operator::DIAG_ONE);
       pcOp->FormSystemMatrix(ess_tdof_list, PCOp);
-      switch (prob) {
-      case 0:
-        pc_r = new DSmoother(*PCOp.As<SparseMatrix>());
-        break;
-      case 1:
-        pc_r = new GSSmoother(*PCOp.As<SparseMatrix>());
-        break;
-      case 2:
-        pc_r = new DSmoother(*PCOp.As<SparseMatrix>());
-        break;
-      default:
-        break; // This should be unreachable
-      }
+      pc_r = new DSmoother(*PCOp.As<SparseMatrix>());
     }
-    real_t s = (prob != 1) ? 1.0 : -1.0;
+    real_t s = 1.0;
     pc_i =
         new ScaledOperator(pc_r, (conv == ComplexOperator::HERMITIAN) ? s : -s);
 
@@ -347,22 +353,8 @@ int main(int argc, char *argv[]) {
     real_t err_r = -1.0;
     real_t err_i = -1.0;
 
-    switch (prob) {
-    case 0:
-      err_r = u.real().ComputeL2Error(u0_r);
-      err_i = u.imag().ComputeL2Error(u0_i);
-      break;
-    case 1:
-      err_r = u.real().ComputeL2Error(u1_r);
-      err_i = u.imag().ComputeL2Error(u1_i);
-      break;
-    case 2:
-      err_r = u.real().ComputeL2Error(u2_r);
-      err_i = u.imag().ComputeL2Error(u2_i);
-      break;
-    default:
-      break; // This should be unreachable
-    }
+    err_r = u.real().ComputeL2Error(u0_r);
+    err_i = u.imag().ComputeL2Error(u0_i);
 
     cout << endl;
     cout << "|| Re (u_h - u) ||_{L^2} = " << err_r << endl;
@@ -456,6 +448,71 @@ int main(int argc, char *argv[]) {
   delete mesh;
 
   return 0;
+}
+
+ConductionOperator::ConductionOperator(FiniteElementSpace &f, real_t al,
+                                       const Vector &u)
+    : TimeDependentOperator(f.GetTrueVSize(), (real_t)0.0, EXPLICIT),
+      fespace(f), M(NULL), K(NULL), T(NULL), current_dt(0.0), z(height) {
+  const real_t rel_tol = 1e-8;
+
+  M = new BilinearForm(&fespace);
+  M->AddDomainIntegrator(new MassIntegrator());
+  M->Assemble();
+  M->FormSystemMatrix(ess_tdof_list, Mmat);
+
+  M_solver.iterative_mode = false;
+  M_solver.SetRelTol(rel_tol);
+  M_solver.SetAbsTol(0.0);
+  M_solver.SetMaxIter(30);
+  M_solver.SetPrintLevel(0);
+  M_solver.SetPreconditioner(M_prec);
+  M_solver.SetOperator(Mmat);
+
+  alpha = al;
+
+  T_solver.iterative_mode = false;
+  T_solver.SetRelTol(rel_tol);
+  T_solver.SetAbsTol(0.0);
+  T_solver.SetMaxIter(100);
+  T_solver.SetPrintLevel(0);
+  T_solver.SetPreconditioner(T_prec);
+
+  setParameters(u);
+}
+
+void ConductionOperator::Mult(const Vector &u, Vector &du_dt) const {
+  // Compute:
+  //    du_dt = M^{-1}*-Ku
+  // for du_dt, where K is linearized by using u from the previous timestep
+  Kmat.Mult(u, z);
+  z.Neg(); // z = -z
+  M_solver.Mult(z, du_dt);
+}
+
+void ConductionOperator::setParameters(const Vector &u) {
+  GridFunction u_alpha_gf(&fespace);
+  u_alpha_gf.SetFromTrueDofs(u);
+  for (int i = 0; i < u_alpha_gf.Size(); i++) {
+    u_alpha_gf(i) = alpha * u_alpha_gf(i);
+  }
+
+  delete K;
+  K = new BilinearForm(&fespace);
+
+  GridFunctionCoefficient u_coeff(&u_alpha_gf);
+
+  K->AddDomainIntegrator(new DiffusionIntegrator(u_coeff));
+  K->Assemble();
+  K->FormSystemMatrix(ess_tdof_list, Kmat);
+  delete T;
+  T = NULL; // re-compute T on the next ImplicitSolve
+}
+
+ConductionOperator::~ConductionOperator() {
+  delete T;
+  delete M;
+  delete K;
 }
 
 bool check_for_inline_mesh(const char *mesh_file) {
