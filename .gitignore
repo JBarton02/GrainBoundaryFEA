@@ -9,7 +9,7 @@
 *.log
 *.log.*
 *.sig
-./mfem/
+mfem/
 
 pkg/
 src/
